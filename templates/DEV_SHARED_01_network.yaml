@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Shared VPC Network Stack - develop/dev-ope/dev-front"
+
+# ==============================================================================
+# 統合VPC構成:
+#   - VPC: 10.100.0.0/16
+#   - Public Subnet x2 (AZ-a, AZ-c) - ALB, NAT Gateway配置
+#   - Private Subnet x2 (AZ-a, AZ-c) - ECS, RDS配置
+#   - NAT Gateway x1 (AZ-aのみ、コスト削減)
+#   - Security Group: 共有リソース用のみ（環境別SGは DEV_SHARED_02_env_sg.yaml で管理）
+#   - dev-secは独立VPCのため含まない
+# ==============================================================================
+
+Parameters:
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+    AllowedValues:
+      - "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  MyRegion:
+    Type: String
+    Default: "ap-northeast-1"
+
+Resources:
+  # ============================================================================
+  # VPC
+  # ============================================================================
+  EC2VPC:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: "10.100.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: "default"
+      Tags:
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "service_role"
+          Value: "vpc"
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-vpc"
+
+  # ============================================================================
+  # Subnets
+  # ============================================================================
+
+  # --- Public Subnets（ALB, NAT Gateway配置用） ---
+  EC2SubnetPublicA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Sub "${MyRegion}a"
+      CidrBlock: "10.100.0.0/24"
+      VpcId: !Ref EC2VPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "subnet"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-public-subnet-${MyRegion}a"
+
+  EC2SubnetPublicC:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Sub "${MyRegion}c"
+      CidrBlock: "10.100.1.0/24"
+      VpcId: !Ref EC2VPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "subnet"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-public-subnet-${MyRegion}c"
+
+  # --- Private Subnets（ECS, RDS配置用・全環境共有） ---
+  EC2SubnetPrivateA:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Sub "${MyRegion}a"
+      CidrBlock: "10.100.10.0/24"
+      VpcId: !Ref EC2VPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "subnet"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-private-subnet-${MyRegion}a"
+
+  EC2SubnetPrivateC:
+    Type: "AWS::EC2::Subnet"
+    Properties:
+      AvailabilityZone: !Sub "${MyRegion}c"
+      CidrBlock: "10.100.11.0/24"
+      VpcId: !Ref EC2VPC
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "subnet"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-private-subnet-${MyRegion}c"
+
+  # ============================================================================
+  # Internet Gateway
+  # ============================================================================
+  EC2InternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+    Properties:
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "igw"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-igw"
+
+  AttachGateway:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      InternetGatewayId: !Ref EC2InternetGateway
+      VpcId: !Ref EC2VPC
+
+  # ============================================================================
+  # EIP + NAT Gateway（AZ-aのみ・コスト削減のため1つに集約）
+  # ============================================================================
+  EC2EIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "eip"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-nat-eip-${MyRegion}a"
+
+  EC2NatGateway:
+    Type: "AWS::EC2::NatGateway"
+    DependsOn: AttachGateway
+    Properties:
+      SubnetId: !Ref EC2SubnetPublicA
+      AllocationId: !GetAtt EC2EIP.AllocationId
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "nat"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-nat-gw-${MyRegion}a"
+
+  # ============================================================================
+  # Route Tables
+  # ============================================================================
+
+  # --- Public Route Table（IGW経由・両AZ共有） ---
+  EC2RouteTablePublic:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref EC2VPC
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "route_table"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-public-table"
+
+  EC2RouteIGW:
+    Type: "AWS::EC2::Route"
+    DependsOn: AttachGateway
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref EC2InternetGateway
+      RouteTableId: !Ref EC2RouteTablePublic
+
+  EC2SubnetRouteTableAssociationPublicA:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref EC2RouteTablePublic
+      SubnetId: !Ref EC2SubnetPublicA
+
+  EC2SubnetRouteTableAssociationPublicC:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref EC2RouteTablePublic
+      SubnetId: !Ref EC2SubnetPublicC
+
+  # --- Private Route Table（NAT経由・両AZ共有・NATが1つなのでRTも1つ） ---
+  EC2RouteTablePrivate:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref EC2VPC
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "route_table"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-private-table"
+
+  EC2RouteNat:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref EC2NatGateway
+      RouteTableId: !Ref EC2RouteTablePrivate
+
+  EC2SubnetRouteTableAssociationPrivateA:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref EC2RouteTablePrivate
+      SubnetId: !Ref EC2SubnetPrivateA
+
+  EC2SubnetRouteTableAssociationPrivateC:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref EC2RouteTablePrivate
+      SubnetId: !Ref EC2SubnetPrivateC
+
+  # ============================================================================
+  # S3 Gateway Endpoint（無料・NAT Gateway経由のS3転送費を削減）
+  # ECRイメージレイヤーのPullもS3経由のため、この Endpoint で無料経路になる
+  # ============================================================================
+  S3GatewayEndpoint:
+    Type: "AWS::EC2::VPCEndpoint"
+    Properties:
+      VpcId: !Ref EC2VPC
+      ServiceName: !Sub "com.amazonaws.${MyRegion}.s3"
+      VpcEndpointType: "Gateway"
+      RouteTableIds:
+        - !Ref EC2RouteTablePrivate
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-s3-gateway-endpoint"
+
+  # ============================================================================
+  # DB Subnet Group（各環境のRDSが共有）
+  # ============================================================================
+  RDSDBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupName: !Sub "${MyEnvironment}-${MyProject}-db-subnet-group"
+      DBSubnetGroupDescription: "Shared VPC DB Subnet Group"
+      SubnetIds:
+        - !Ref EC2SubnetPrivateA
+        - !Ref EC2SubnetPrivateC
+      Tags:
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-db-subnet-group"
+
+  # ============================================================================
+  # Security Groups - 共有リソース用
+  # 環境別SGは DEV_SHARED_02_env_sg.yaml で環境ごとにデプロイ
+  # ============================================================================
+
+  # --- 共有ALB用SG（HTTP/HTTPS受信） ---
+  SGSharedAlb:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Shared ALB - Allow HTTP/HTTPS inbound"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-shared-alb-sg"
+      VpcId: !Ref EC2VPC
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "-1"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-shared-alb-sg"
+
+  # --- 共有Adminer用SG ---
+  # Egressは VPC CIDR の 3306 に許可（環境追加時にテンプレート修正不要）
+  # RDS側のIngressで環境ごとのアクセス制御を行う
+  SGSharedAdminer:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Shared Adminer - Allow 8080 inbound from ALB"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-shared-adminer-sg"
+      VpcId: !Ref EC2VPC
+      SecurityGroupEgress:
+        - CidrIp: "10.100.0.0/16"
+          IpProtocol: "tcp"
+          FromPort: 3306
+          ToPort: 3306
+          Description: "Allow 3306 to VPC CIDR for all RDS access"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-shared-adminer-sg"
+
+  SGSharedAdminerIngress8080:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref SGSharedAdminer
+      IpProtocol: "tcp"
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref SGSharedAlb
+
+  # --- ECSタスク共通 アウトバウンド用SG（HTTP/HTTPS/DNS） ---
+  SGSharedMgt:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Shared Management - Allow outbound for image pull, external API, etc."
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-shared-mgt-sg"
+      VpcId: !Ref EC2VPC
+      SecurityGroupEgress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 443
+          ToPort: 443
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "tcp"
+          FromPort: 53
+          ToPort: 53
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "udp"
+          FromPort: 53
+          ToPort: 53
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-shared-mgt-sg"
+
+  # ============================================================================
+  # SSM Parameter Store（最小限・後続スタック参照用）
+  # ============================================================================
+  SSMMyEnvironment:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/cf-values/dev-shared/MyEnvironment"
+      Type: String
+      Value: !Ref MyEnvironment
+
+  SSMMyVPCId:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/cf-values/dev-shared/MyVPCId"
+      Type: String
+      Value: !Ref EC2VPC
+
+  SSMMyProject:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/cf-values/dev-shared/MyProject"
+      Type: String
+      Value: !Ref MyProject
+
+  SSMMyRegion:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/cf-values/dev-shared/MyRegion"
+      Type: String
+      Value: !Ref MyRegion
+
+  SSMMyManagedBy:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name: "/cf-values/dev-shared/MyManagedBy"
+      Type: String
+      Value: !Ref MyManagedBy
+
+# ==============================================================================
+# Outputs（後続スタック・各環境CFnからの参照用）
+# ==============================================================================
+Outputs:
+  # --- VPC ---
+  VPCId:
+    Description: "統合VPC ID"
+    Value: !Ref EC2VPC
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+
+  # --- Subnets ---
+  EC2SubnetPublicA:
+    Description: "Public Subnet AZ-a"
+    Value: !Ref EC2SubnetPublicA
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPublicA"
+
+  EC2SubnetPublicC:
+    Description: "Public Subnet AZ-c"
+    Value: !Ref EC2SubnetPublicC
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPublicC"
+
+  EC2SubnetPrivateA:
+    Description: "Private Subnet AZ-a"
+    Value: !Ref EC2SubnetPrivateA
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+
+  EC2SubnetPrivateC:
+    Description: "Private Subnet AZ-c"
+    Value: !Ref EC2SubnetPrivateC
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+
+  # --- DB Subnet Group ---
+  RDSDBSubnetGroup:
+    Description: "DB Subnet Group（各環境RDS用）"
+    Value: !Ref RDSDBSubnetGroup
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-RDSDBSubnetGroup"
+
+  # --- Security Groups: 共有 ---
+  SGSharedAlb:
+    Description: "共有ALB用SG"
+    Value: !Ref SGSharedAlb
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SGSharedAlb"
+
+  SGSharedAdminer:
+    Description: "共有Adminer用SG"
+    Value: !Ref SGSharedAdminer
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SGSharedAdminer"
+
+  SGSharedMgt:
+    Description: "ECSタスク共通アウトバウンドSG"
+    Value: !Ref SGSharedMgt
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"

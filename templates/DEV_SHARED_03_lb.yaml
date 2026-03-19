@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Shared ALB Stack - Unified ALB + HTTPS Listener (host-header routing)"
+
+# ==============================================================================
+# 統合ALB構成:
+#   - 1つのALBで全環境のAPI/Mailpit/Adminerをホストヘッダベースでルーティング
+#   - HTTPS Listener 1つ（デフォルト: 404固定レスポンス）
+#   - HTTP → HTTPS リダイレクト
+#
+#   各環境のTarget Group/Listener Ruleは DEV_SHARED_04_env_lb.yaml で管理
+#   AdminerのTarget Group/ECSは DEV_SHARED_05_adminer.yaml で管理
+#
+# 前提:
+#   - ACM証明書は各環境で発行済みのものを使用
+#   - DefaultCertArn にはいずれかの環境のACM証明書ARNを指定
+#   - 各環境/サービスの証明書はListenerCertificateとしてSNI追加
+# ==============================================================================
+
+Parameters:
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+    AllowedValues:
+      - "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  # HTTPS Listenerのデフォルト証明書（いずれかの環境のACM証明書ARNを指定）
+  DefaultCertArn:
+    Type: String
+    Description: "HTTPS Listenerのデフォルト証明書ARN（SNIで他の証明書を追加可能）"
+
+Resources:
+  # ============================================================================
+  # 統合ALB（API / Mailpit / Adminer 全サービス共用）
+  # ============================================================================
+  SharedAlb:
+    Type: "AWS::ElasticLoadBalancingV2::LoadBalancer"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${MyProject}-alb"
+      Scheme: "internet-facing"
+      Type: "application"
+      Subnets:
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPublicA"
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPublicC"
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAlb"
+      IpAddressType: "ipv4"
+      Tags:
+        - Key: "service_role"
+          Value: "alb"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-alb"
+      LoadBalancerAttributes:
+        - Key: "access_logs.s3.enabled"
+          Value: "false"
+        - Key: "idle_timeout.timeout_seconds"
+          Value: "60"
+        - Key: "deletion_protection.enabled"
+          Value: "false"
+        - Key: "routing.http2.enabled"
+          Value: "true"
+        - Key: "load_balancing.cross_zone.enabled"
+          Value: "true"
+        - Key: "routing.http.desync_mitigation_mode"
+          Value: "defensive"
+
+  # HTTPS Listener（デフォルト: 404固定レスポンス）
+  # 全サービス・全環境のルーティングをListener Ruleで行う
+  SharedAlbHttpsListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      LoadBalancerArn: !Ref SharedAlb
+      Port: 443
+      Protocol: "HTTPS"
+      SslPolicy: "ELBSecurityPolicy-TLS13-1-2-2021-06"
+      Certificates:
+        - CertificateArn: !Ref DefaultCertArn
+      DefaultActions:
+        - Type: "fixed-response"
+          FixedResponseConfig:
+            StatusCode: "404"
+            ContentType: "text/plain"
+            MessageBody: "Not Found"
+
+  # HTTP → HTTPS リダイレクト
+  SharedAlbHttpListener:
+    Type: "AWS::ElasticLoadBalancingV2::Listener"
+    Properties:
+      LoadBalancerArn: !Ref SharedAlb
+      Port: 80
+      Protocol: "HTTP"
+      DefaultActions:
+        - Type: "redirect"
+          RedirectConfig:
+            Protocol: "HTTPS"
+            Port: "443"
+            StatusCode: "HTTP_301"
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  SharedAlb:
+    Description: "統合ALB ARN"
+    Value: !Ref SharedAlb
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SharedAlb"
+
+  SharedAlbDnsName:
+    Description: "統合ALB DNS名（Route53 CNAME/Alias設定用）"
+    Value: !GetAtt SharedAlb.DNSName
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SharedAlbDnsName"
+
+  SharedAlbHostedZoneId:
+    Description: "統合ALB HostedZone ID（Route53 Alias設定用）"
+    Value: !GetAtt SharedAlb.CanonicalHostedZoneID
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHostedZoneId"
+
+  SharedAlbHttpsListener:
+    Description: "統合ALB HTTPS Listener ARN"
+    Value: !Ref SharedAlbHttpsListener
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"

@@ -1,0 +1,305 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Shared Adminer Stack - IAM Roles + ECS Cluster + Service + Task Definition + ALB Listener Rule"
+
+# ==============================================================================
+# 共有Adminer構成:
+#   - 全環境で1つのAdminerサービスを共有
+#   - Adminer UIから接続先のRDSを選択（各環境のRDSに接続可能）
+#   - SGSharedAdminer: VPC CIDR宛のport 3306 Egressで全RDSにアクセス
+#   - SGSharedMgt: ECRイメージPull、DNS等のアウトバウンド通信
+#   - IAMロール: ECSタスク用とタスク実行用を作成
+#
+# 前提:
+#   - 03_lb.yaml の統合ALBがデプロイ済み
+# ==============================================================================
+
+Parameters:
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+    AllowedValues:
+      - "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  AdminerHostHeader:
+    Type: String
+    Description: "Adminerのホストヘッダ（例: adminer-dev.shikigaku-cloud.com）"
+
+  AdminerCertArn:
+    Type: String
+    Description: "Adminer用ACM証明書ARN"
+
+Resources:
+  # ============================================================================
+  # IAM Roles
+  # ============================================================================
+
+  # ECSタスクロール（コンテナ内のアプリケーションが使用）
+  # Adminerはシンプルなツールなのでecs-execのみ
+  EcsTaskRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${MyEnvironment}-${MyProject}-ecs-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Tags:
+        - Key: "service_role"
+          Value: "iam"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+
+  # ECSタスク実行ロール（ECSエージェントがイメージPull・ログ送信等に使用）
+  EcsTaskExecRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${MyEnvironment}-${MyProject}-ecs-task-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Tags:
+        - Key: "service_role"
+          Value: "iam"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+
+  # ============================================================================
+  # ECS Cluster（FARGATE_SPOT でコスト最適化）
+  # ============================================================================
+  ECSClusterAdminer:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Sub "${MyEnvironment}-${MyProject}-adminer"
+      CapacityProviders:
+        - "FARGATE_SPOT"
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: "FARGATE_SPOT"
+          Weight: 1
+          Base: 1
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-ecs-cluster-adminer"
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+
+  # ============================================================================
+  # CloudWatch Log Group
+  # ============================================================================
+  LogsLogGroupAdminer:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/${MyEnvironment}/${MyProject}/ecs/adminer"
+      RetentionInDays: 30
+
+  # ============================================================================
+  # Target Group
+  # ============================================================================
+  AdminerTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${MyProject}-adminer"
+      Port: 8080
+      Protocol: "HTTP"
+      TargetType: "ip"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      HealthCheckEnabled: true
+      Tags:
+        - Key: "service_role"
+          Value: "alb"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-adminer"
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "300"
+        - Key: "stickiness.enabled"
+          Value: "false"
+        - Key: "load_balancing.algorithm.type"
+          Value: "round_robin"
+
+  # ============================================================================
+  # Listener Certificate + Rule（統合ALBのHTTPS Listenerに追加）
+  # ============================================================================
+  AdminerListenerCertificate:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerCertificate"
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Certificates:
+        - CertificateArn: !Ref AdminerCertArn
+
+  AdminerListenerRule:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerRule"
+    DependsOn: AdminerTargetGroup
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Priority: 30
+      Conditions:
+        - Field: "host-header"
+          HostHeaderConfig:
+            Values:
+              - !Ref AdminerHostHeader
+      Actions:
+        - Type: "forward"
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref AdminerTargetGroup
+                Weight: 1
+
+  # ============================================================================
+  # ECS Task Definition
+  # ============================================================================
+  ECSTaskDefinitionAdminer:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      Family: !Sub "${MyEnvironment}-${MyProject}-adminer"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "256"
+      Memory: "512"
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ExecutionRoleArn: !GetAtt EcsTaskExecRole.Arn
+      ContainerDefinitions:
+        - Name: "adminer"
+          Essential: true
+          Image: "adminer:5.4.2"
+          PortMappings:
+            - ContainerPort: 8080
+              HostPort: 8080
+              Protocol: "tcp"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub "/${MyEnvironment}/${MyProject}/ecs/adminer"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+
+  # ============================================================================
+  # ECS Service
+  # ============================================================================
+  ECSServiceAdminer:
+    Type: "AWS::ECS::Service"
+    DependsOn: AdminerListenerRule
+    Properties:
+      ServiceName: !Sub "${MyEnvironment}-${MyProject}-adminer"
+      Cluster: !Ref ECSClusterAdminer
+      DesiredCount: 1
+      # LaunchType は指定しない（ClusterのDefaultCapacityProviderStrategy = FARGATE_SPOTを使用）
+      PlatformVersion: "1.4.0"
+      TaskDefinition: !Ref ECSTaskDefinitionAdminer
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAdminer"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          Subnets:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+      LoadBalancers:
+        - TargetGroupArn: !Ref AdminerTargetGroup
+          ContainerName: "adminer"
+          ContainerPort: 8080
+      HealthCheckGracePeriodSeconds: 5
+      SchedulingStrategy: "REPLICA"
+      DeploymentController:
+        Type: "ECS"
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-adminer"
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  EcsTaskRole:
+    Description: "ECS Task Role ARN"
+    Value: !GetAtt EcsTaskRole.Arn
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EcsTaskRoleArn"
+
+  EcsTaskExecRole:
+    Description: "ECS Task Execution Role ARN"
+    Value: !GetAtt EcsTaskExecRole.Arn
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-EcsTaskExecRoleArn"
+
+  ECSClusterAdminer:
+    Description: "Adminer ECS Cluster"
+    Value: !Ref ECSClusterAdminer
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-ECSClusterAdminer"
+
+  AdminerTargetGroup:
+    Description: "Adminer Target Group"
+    Value: !Ref AdminerTargetGroup
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-AdminerTargetGroup"
+
+  ECSServiceAdminer:
+    Description: "Adminer ECS Service"
+    Value: !Ref ECSServiceAdminer
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-ECSServiceAdminer"

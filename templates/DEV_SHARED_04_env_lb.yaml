@@ -1,0 +1,235 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment ALB Config - Target Groups + Listener Rules + Listener Certificates"
+
+# ==============================================================================
+# 使い方:
+#   deploy.sh で環境ごとにデプロイされる。
+#   環境追加時:
+#     1. deploy.sh の ENVIRONMENTS と get_env_lb_params に追加
+#     2. EnvPriority Mappings にエントリ追加
+#     3. EnvName の AllowedValues に追加
+#
+# リソース構成（環境ごと）:
+#   API:
+#     - Target Group
+#     - Listener Rule（ホストヘッダ条件）
+#     - Listener Certificate（SNI用）
+#   Mailpit:
+#     - Target Group
+#     - Listener Rule（ホストヘッダ条件）
+#     - Listener Certificate（SNI用）
+#
+# 全サービスが同一の統合ALB HTTPS Listenerにルーティングルールを追加する
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  # 各環境のACM証明書ARN（deploy.shから渡す）
+  ApiCertArn:
+    Type: String
+    Description: "この環境のAPI用ACM証明書ARN"
+
+  MailpitCertArn:
+    Type: String
+    Description: "この環境のMailpit用ACM証明書ARN"
+
+  # ホストヘッダ（deploy.shから渡す）
+  ApiHostHeader:
+    Type: String
+    Description: "APIのホストヘッダ（例: api-testdevelop.shikigaku-cloud.com）"
+
+  MailpitHostHeader:
+    Type: String
+    Description: "Mailpitのホストヘッダ（例: mailpit-testdevelop.shikigaku-cloud.com）"
+
+# Listener Rule の Priority（環境間で一意にする）
+# 全サービスが同一リスナーを共有するため、サービス間でも重複不可
+Mappings:
+  EnvPriority:
+    develop:
+      Api: "10"
+      Mailpit: "20"
+    dev-ope:
+      Api: "11"
+      Mailpit: "21"
+    dev-front:
+      Api: "12"
+      Mailpit: "22"
+
+Resources:
+  # ============================================================================
+  # API Target Group
+  # ============================================================================
+  ApiTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${EnvName}-api"
+      Port: 80
+      Protocol: "HTTP"
+      TargetType: "ip"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/health_check"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      HealthCheckEnabled: true
+      Tags:
+        - Key: "service_role"
+          Value: "alb"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${EnvName}-api"
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "300"
+        - Key: "stickiness.enabled"
+          Value: "false"
+        - Key: "load_balancing.algorithm.type"
+          Value: "round_robin"
+
+  # ============================================================================
+  # API Listener Rule + Certificate（統合ALBのHTTPS Listenerに追加）
+  # ============================================================================
+  ApiListenerCertificate:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerCertificate"
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Certificates:
+        - CertificateArn: !Ref ApiCertArn
+
+  ApiListenerRule:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerRule"
+    DependsOn: ApiTargetGroup
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Priority: !FindInMap [EnvPriority, !Ref EnvName, Api]
+      Conditions:
+        - Field: "host-header"
+          HostHeaderConfig:
+            Values:
+              - !Ref ApiHostHeader
+      Actions:
+        - Type: "forward"
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref ApiTargetGroup
+                Weight: 1
+
+  # ============================================================================
+  # Mailpit Target Group
+  # ============================================================================
+  MailpitTargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${EnvName}-mailpit"
+      Port: 8025
+      Protocol: "HTTP"
+      TargetType: "ip"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 5
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: "200"
+      HealthCheckEnabled: true
+      Tags:
+        - Key: "service_role"
+          Value: "alb"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${EnvName}-mailpit"
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "300"
+        - Key: "stickiness.enabled"
+          Value: "false"
+        - Key: "load_balancing.algorithm.type"
+          Value: "round_robin"
+
+  # ============================================================================
+  # Mailpit Listener Rule + Certificate（統合ALBのHTTPS Listenerに追加）
+  # ============================================================================
+  MailpitListenerCertificate:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerCertificate"
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Certificates:
+        - CertificateArn: !Ref MailpitCertArn
+
+  MailpitListenerRule:
+    Type: "AWS::ElasticLoadBalancingV2::ListenerRule"
+    DependsOn: MailpitTargetGroup
+    Properties:
+      ListenerArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SharedAlbHttpsListener"
+      Priority: !FindInMap [EnvPriority, !Ref EnvName, Mailpit]
+      Conditions:
+        - Field: "host-header"
+          HostHeaderConfig:
+            Values:
+              - !Ref MailpitHostHeader
+      Actions:
+        - Type: "forward"
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref MailpitTargetGroup
+                Weight: 1
+
+# ==============================================================================
+# Outputs（各環境のECSからの参照用）
+# ==============================================================================
+Outputs:
+  ApiTargetGroup:
+    Description: "API Target Group"
+    Value: !Ref ApiTargetGroup
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ApiTargetGroup"
+
+  MailpitTargetGroup:
+    Description: "Mailpit Target Group"
+    Value: !Ref MailpitTargetGroup
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitTargetGroup"

@@ -1,0 +1,296 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment Security Groups - deployed per environment via parameter"
+
+# ==============================================================================
+# 使い方:
+#   deploy.sh で環境ごとにデプロイされる。
+#   環境追加時はdeploy.shの ENVIRONMENTS リストに追加するだけでOK。
+#
+#   各ECSタスクにアタッチするSGの組み合わせ:
+#     API   = ApiSG + RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
+#     Batch = RdsSG + SGSharedMgt
+#     Mailpit = MailpitWebSG + MailpitSmtpSG + SGSharedMgt
+#     Redis = RedisSG + SGSharedMgt
+#     RDS   = RdsSG
+#     Adminer = SGSharedAdminer + SGSharedMgt
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+    Description: "統合VPC環境名（networkスタックと合わせる）"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+Resources:
+  # ============================================================================
+  # API SG（ALBからのport 80受信のみ・アウトバウンドは専用SGに委任）
+  # ============================================================================
+  ApiSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${EnvName} - API ECS task (inbound only)"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api-sg"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"
+          Description: "Disable default egress (outbound managed by dedicated SG)"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api-sg"
+
+  ApiSGIngress80:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref ApiSG
+      IpProtocol: "tcp"
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAlb"
+
+  # ============================================================================
+  # RDS SG（自己参照パターン + Adminerからの受信）
+  # ECSタスク(API/Batch)とRDSの両方にこのSGをアタッチして使用
+  # 自己参照SGにより、他環境からの横断アクセスは自然に防止される
+  # ============================================================================
+  RdsSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${EnvName} - RDS Aurora MySQL"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-rds-sg"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"
+          Description: "Disable default egress (self-ref egress defined separately)"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-rds-sg"
+
+  # ECSタスク(API/Batch) ↔ RDS（自己参照）
+  RdsSGIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: "tcp"
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref RdsSG
+
+  RdsSGEgressSelf:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: "tcp"
+      FromPort: 3306
+      ToPort: 3306
+      DestinationSecurityGroupId: !Ref RdsSG
+
+  # 共有Adminer → この環境のRDS
+  RdsSGIngressAdminer:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref RdsSG
+      IpProtocol: "tcp"
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAdminer"
+
+  # ============================================================================
+  # Redis SG（自己参照パターン）
+  # ECSタスク(API)とRedis ECSコンテナの両方にこのSGをアタッチ
+  # ============================================================================
+  RedisSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${EnvName} - Redis (ECS)"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis-sg"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"
+          Description: "Disable default egress (self-ref egress defined separately)"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis-sg"
+
+  RedisSGIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref RedisSG
+      IpProtocol: "tcp"
+      FromPort: 6379
+      ToPort: 6379
+      SourceSecurityGroupId: !Ref RedisSG
+
+  RedisSGEgressSelf:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      GroupId: !Ref RedisSG
+      IpProtocol: "tcp"
+      FromPort: 6379
+      ToPort: 6379
+      DestinationSecurityGroupId: !Ref RedisSG
+
+  # ============================================================================
+  # Mailpit Web SG（ALBからの8025受信）
+  # ============================================================================
+  MailpitWebSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${EnvName} - Mailpit Web UI"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit-web-sg"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"
+          Description: "Disable default egress (inbound only SG)"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit-web-sg"
+
+  MailpitWebSGIngress:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref MailpitWebSG
+      IpProtocol: "tcp"
+      FromPort: 8025
+      ToPort: 8025
+      SourceSecurityGroupId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAlb"
+
+  # ============================================================================
+  # Mailpit SMTP SG（自己参照パターン）
+  # ECSタスク(API)とMailpit ECSコンテナの両方にこのSGをアタッチ
+  # 自己参照SGにより、他環境からの横断アクセスは自然に防止される
+  # ============================================================================
+  MailpitSmtpSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub "${EnvName} - Mailpit SMTP"
+      GroupName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit-smtp-sg"
+      VpcId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "127.0.0.1/32"
+          Description: "Disable default egress (self-ref egress defined separately)"
+      Tags:
+        - Key: "service_role"
+          Value: "sg"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit-smtp-sg"
+
+  # ECSタスク(API) ↔ Mailpit（自己参照）
+  MailpitSmtpSGIngressSelf:
+    Type: "AWS::EC2::SecurityGroupIngress"
+    Properties:
+      GroupId: !Ref MailpitSmtpSG
+      IpProtocol: "tcp"
+      FromPort: 1025
+      ToPort: 1025
+      SourceSecurityGroupId: !Ref MailpitSmtpSG
+
+  MailpitSmtpSGEgressSelf:
+    Type: "AWS::EC2::SecurityGroupEgress"
+    Properties:
+      GroupId: !Ref MailpitSmtpSG
+      IpProtocol: "tcp"
+      FromPort: 1025
+      ToPort: 1025
+      DestinationSecurityGroupId: !Ref MailpitSmtpSG
+
+# ==============================================================================
+# Outputs（各環境CFnからの参照用）
+# Export名に環境名を含め、環境ごとに一意にする
+# ==============================================================================
+Outputs:
+  ApiSG:
+    Description: "API SG"
+    Value: !Ref ApiSG
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ApiSG"
+
+  RdsSG:
+    Description: "RDS SG"
+    Value: !Ref RdsSG
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RdsSG"
+
+  RedisSG:
+    Description: "Redis SG"
+    Value: !Ref RedisSG
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RedisSG"
+
+  MailpitWebSG:
+    Description: "Mailpit Web SG"
+    Value: !Ref MailpitWebSG
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitWebSG"
+
+  MailpitSmtpSG:
+    Description: "Mailpit SMTP SG"
+    Value: !Ref MailpitSmtpSG
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitSmtpSG"

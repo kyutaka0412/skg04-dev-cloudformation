@@ -1,0 +1,29 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# AWS
+.aws-sam/
+samconfig.toml
+
+# CloudFormation packaged artifacts
+packaged-*.yaml
+packaged-*.json
+
+# Temporary files
+*.tmp
+*.bak
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key

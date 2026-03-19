@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Bastion EC2 for SSM-based RDS access"
+
+# ==============================================================================
+# SSM経由でRDSに接続するための踏み台EC2
+#   - SSM Session Manager経由で接続（SSH不要、パブリックIP不要）
+#   - SGSharedAdminer: VPC CIDR宛の3306 Egressで全環境のRDSにアクセス可能
+#   - SGSharedMgt: SSMエージェント通信用のアウトバウンド（443等）
+#   - IAMインスタンスプロファイルは既存の dev-skg04-ssm を流用
+# ==============================================================================
+
+Parameters:
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+    AllowedValues:
+      - "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  InstanceType:
+    Type: String
+    Default: "t3.nano"
+    AllowedValues:
+      - "t3.nano"
+      - "t3.micro"
+      - "t2.micro"
+
+  # SSM用IAMインスタンスプロファイル（既存のものを流用）
+  IamInstanceProfile:
+    Type: String
+    Default: "dev-skg04-ssm"
+
+Resources:
+  # ============================================================================
+  # Bastion EC2 Instance
+  # ============================================================================
+  BastionInstance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: !Ref InstanceType
+      # Amazon Linux 2023 最新AMI（SSM Parameter Store経由）
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}"
+      SubnetId:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+      SecurityGroupIds:
+        # SGSharedAdminer: VPC CIDR宛の3306 Egress（全環境RDSアクセス用）
+        # 各環境のRdsSGは SGSharedAdminer からの3306 Ingressを許可済み
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedAdminer"
+        # SGSharedMgt: アウトバウンドHTTP/HTTPS/DNS（SSMエージェント通信用）
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+      IamInstanceProfile: !Ref IamInstanceProfile
+      # IMDSv2を強制
+      MetadataOptions:
+        HttpTokens: "required"
+        HttpPutResponseHopLimit: 2
+        HttpEndpoint: "enabled"
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: 8
+            VolumeType: "gp3"
+            DeleteOnTermination: true
+      Tags:
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-bastion"
+        - Key: "service_role"
+          Value: "ec2"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "environment"
+          Value: !Ref MyEnvironment
+
+Outputs:
+  BastionInstanceId:
+    Description: "Bastion EC2 Instance ID"
+    Value: !Ref BastionInstance
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-BastionInstanceId"
