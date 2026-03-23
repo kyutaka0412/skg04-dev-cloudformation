@@ -25,7 +25,7 @@ AWS_PROFILE="dev-skg04"
 AWS_REGION="ap-northeast-1"
 
 # 環境名リスト（追加時はここに追加）
-ENVIRONMENTS=("develop" "dev-ope" "dev-front")
+ENVIRONMENTS=("develop" "dev-ope" "dev-front" "dev-demo")
 
 # ==============================================================================
 # ALB関連の設定
@@ -64,9 +64,41 @@ get_env_lb_params() {
            "ApiHostHeader=api-dev-front.shikigaku-cloud.com" \
            "MailpitHostHeader=mailpit-dev-front.shikigaku-cloud.com"
       ;;
+    dev-demo)
+      # TODO: ACM証明書ARNを発行後に設定する
+      echo "ApiCertArn=arn:aws:acm:ap-northeast-1:186095208202:certificate/PLACEHOLDER-API-DEV-DEMO" \
+           "MailpitCertArn=arn:aws:acm:ap-northeast-1:186095208202:certificate/PLACEHOLDER-MAILPIT-DEV-DEMO" \
+           "ApiHostHeader=api-dev-demo.shikigaku-cloud.com" \
+           "MailpitHostHeader=mailpit-dev-demo.shikigaku-cloud.com"
+      ;;
     *)
       echo "ERROR: Unknown environment: $env_name" >&2
       exit 1
+      ;;
+  esac
+}
+
+# ==============================================================================
+# パイプライン関連の設定
+# ==============================================================================
+
+# GitHub Connection ARN（CodeStar）
+GITHUB_CONNECTION_ARN="arn:aws:codestar-connections:ap-northeast-1:186095208202:connection/PLACEHOLDER-GITHUB-CONNECTION"
+
+# ==============================================================================
+# テンプレートごとの対象環境リストを返す
+# 新規テンプレート（07〜10）はPhase 2でimport完了するまでdev-demoのみ
+# ==============================================================================
+get_env_list_for_template() {
+  local filename=$1
+  case "$filename" in
+    *07_env_rds*|*08_env_ecr*|*09_env_ecs*|*10_env_pipeline*)
+      # Phase 2でimport完了するまでは dev-demo のみ
+      echo "dev-demo"
+      ;;
+    *)
+      # 既存テンプレートは全環境
+      echo "${ENVIRONMENTS[@]}"
       ;;
   esac
 }
@@ -154,6 +186,9 @@ deploy_env_stack() {
 
   cleanup_failed_stack "$stack_name"
 
+  # PLACEHOLDERチェック
+  validate_no_placeholders "$@"
+
   aws cloudformation deploy \
     --template-file "$template_file" \
     --stack-name "$stack_name" \
@@ -193,10 +228,25 @@ get_env_params() {
     *04_env_lb*)
       get_env_lb_params "$env_name"
       ;;
+    *10_env_pipeline*)
+      echo "GitHubConnectionArn=${GITHUB_CONNECTION_ARN}"
+      ;;
     *)
       echo ""
       ;;
   esac
+}
+
+# ==============================================================================
+# PLACEHOLDERチェック（デプロイ前にバリデーション）
+# ==============================================================================
+validate_no_placeholders() {
+  local params="$*"
+  if [[ "$params" == *"PLACEHOLDER"* ]]; then
+    echo "ERROR: PLACEHOLDER values detected in parameters. Update deploy.sh with actual ARNs." >&2
+    echo "  Params: $params" >&2
+    exit 1
+  fi
 }
 
 # ==============================================================================
@@ -218,9 +268,11 @@ for template_file in "$TEMPLATE_DIR"/*.yaml; do
   filename=$(basename "$template_file" .yaml)
 
   if [[ "$filename" == *"$ENV_TEMPLATE_PATTERN"* ]]; then
-    # 環境別テンプレート → 環境数分ループ
+    # 環境別テンプレート → 対象環境分ループ
     base_stack_name="${filename//_/-}"
-    for env_name in "${ENVIRONMENTS[@]}"; do
+    # shellcheck disable=SC2207
+    env_list=($(get_env_list_for_template "$filename"))
+    for env_name in "${env_list[@]}"; do
       env_params=$(get_env_params "$filename" "$env_name")
       # shellcheck disable=SC2086
       deploy_env_stack "$template_file" "$base_stack_name" "$env_name" $env_params

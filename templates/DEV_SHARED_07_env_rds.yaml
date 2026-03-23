@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment Aurora Serverless v2 + KMS"
+
+# ==============================================================================
+# Aurora Serverless v2 クラスタ + KMSキー
+# 環境ごとに独立したRDSクラスタを作成
+# KMSキーもRDS暗号化用に環境ごとに作成
+#
+# 依存する共有リソース:
+#   - RDSDBSubnetGroup (01_network)
+#   - RdsSG (02_env_sg)
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+      - "dev-demo"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  MyDBEngine:
+    Type: String
+    Default: "aurora-mysql"
+
+  MyDBEngineVersion:
+    Type: String
+    Default: "8.0.mysql_aurora.3.10.3"
+
+  MyDBEngineFamily:
+    Type: String
+    Default: "aurora-mysql8.0"
+
+  MyDBClusterParameterGroupName:
+    Type: String
+    Default: "default.aurora-mysql8.0"
+
+  MyDBPort:
+    Type: Number
+    Default: 3306
+
+  MyDBInstanceClass:
+    Type: String
+    Default: "db.serverless"
+
+Mappings:
+  # DBの管理ユーザーのパスワード
+  RdsRootPasswordsMapping:
+    develop:
+      MyRdsRootPasswords: "hoh7EeMahchooKee"
+    dev-ope:
+      MyRdsRootPasswords: "Geireigheideeph1"
+    dev-front:
+      MyRdsRootPasswords: "hoh7EeMahchooKee"
+    dev-demo:
+      MyRdsRootPasswords: "Eizoo0aequahg4ph"
+
+  # DB名
+  RdsDatabaseNamesMapping:
+    develop:
+      MyRdsDatabaseNames: "skg04"
+    dev-ope:
+      MyRdsDatabaseNames: "skg04"
+    dev-front:
+      MyRdsDatabaseNames: "skg04"
+    dev-demo:
+      MyRdsDatabaseNames: "skg04"
+
+  # RDSの最小キャパシティ（0 = ゼロスケール対応）
+  RdsClusterMinCapacitiesMapping:
+    develop:
+      MyRdsClusterMinCapacities: 0
+    dev-ope:
+      MyRdsClusterMinCapacities: 0
+    dev-front:
+      MyRdsClusterMinCapacities: 0
+    dev-demo:
+      MyRdsClusterMinCapacities: 0
+
+  # RDSの最大キャパシティ
+  RdsClusterMaxCapacitiesMapping:
+    develop:
+      MyRdsClusterMaxCapacities: 2
+    dev-ope:
+      MyRdsClusterMaxCapacities: 1
+    dev-front:
+      MyRdsClusterMaxCapacities: 1
+    dev-demo:
+      MyRdsClusterMaxCapacities: 1
+
+Resources:
+  # ============================================================================
+  # KMS Key（RDS暗号化用）
+  # ============================================================================
+  KMSKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Enabled: true
+      Description: !Sub "${MyEnvironment}-${MyProject}-${EnvName} RDS encryption key"
+      KeyUsage: "ENCRYPT_DECRYPT"
+      KeyPolicy: !Sub |
+        {
+          "Version" : "2012-10-17",
+          "Id" : "key-default-1",
+          "Statement" : [ {
+            "Sid" : "Enable IAM User Permissions",
+            "Effect" : "Allow",
+            "Principal" : {
+              "AWS" : "arn:aws:iam::${AWS::AccountId}:root"
+            },
+            "Action" : "kms:*",
+            "Resource" : "*"
+          } ]
+        }
+      KeySpec: "SYMMETRIC_DEFAULT"
+      MultiRegion: false
+      Tags:
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "vault"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-kms"
+
+  KMSAlias:
+    Type: "AWS::KMS::Alias"
+    Properties:
+      AliasName: !Sub "alias/${MyEnvironment}-${MyProject}-${EnvName}-kms"
+      TargetKeyId: !Ref KMSKey
+
+  # ============================================================================
+  # RDS Parameter Group
+  # ============================================================================
+  RDSDBParameterGroup:
+    Type: "AWS::RDS::DBParameterGroup"
+    Properties:
+      Description: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-parameter-group"
+      Family: !Ref MyDBEngineFamily
+      Parameters:
+        long_query_time: "1"
+        slow_query_log: "1"
+
+  # ============================================================================
+  # Aurora Serverless v2 Cluster
+  # ============================================================================
+  RDSDBCluster:
+    Type: "AWS::RDS::DBCluster"
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${MyEnvironment}-${MyProject}-${EnvName}"
+      Engine: !Ref MyDBEngine
+      EngineVersion: !Ref MyDBEngineVersion
+      EngineMode: "provisioned"
+      Port: !Ref MyDBPort
+      DatabaseName:
+        !FindInMap [
+          RdsDatabaseNamesMapping,
+          !Ref EnvName,
+          MyRdsDatabaseNames,
+        ]
+      MasterUsername:
+        !FindInMap [
+          RdsDatabaseNamesMapping,
+          !Ref EnvName,
+          MyRdsDatabaseNames,
+        ]
+      MasterUserPassword:
+        !FindInMap [
+          RdsRootPasswordsMapping,
+          !Ref EnvName,
+          MyRdsRootPasswords,
+        ]
+      DBClusterParameterGroupName: !Ref MyDBClusterParameterGroupName
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-RDSDBSubnetGroup"
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RdsSG"
+      StorageEncrypted: true
+      KmsKeyId: !Ref KMSKey
+      BackupRetentionPeriod: 1
+      PreferredBackupWindow: "17:46-18:16"
+      PreferredMaintenanceWindow: "mon:19:42-mon:20:12"
+      EnableIAMDatabaseAuthentication: false
+      EnableHttpEndpoint: false
+      DeletionProtection: false
+      ServerlessV2ScalingConfiguration:
+        MaxCapacity:
+          !FindInMap [
+            RdsClusterMaxCapacitiesMapping,
+            !Ref EnvName,
+            MyRdsClusterMaxCapacities,
+          ]
+        MinCapacity:
+          !FindInMap [
+            RdsClusterMinCapacitiesMapping,
+            !Ref EnvName,
+            MyRdsClusterMinCapacities,
+          ]
+      AvailabilityZones:
+        - !Sub "${AWS::Region}c"
+        - !Sub "${AWS::Region}a"
+      Tags:
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "db"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}"
+
+  # ============================================================================
+  # Aurora Serverless v2 Instance
+  # ============================================================================
+  RDSDBInstance1:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      DBInstanceIdentifier: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-instance1"
+      DBInstanceClass: !Ref MyDBInstanceClass
+      Engine: !Ref MyDBEngine
+      DBClusterIdentifier: !Ref RDSDBCluster
+      AvailabilityZone: !Sub "${AWS::Region}a"
+      AutoMinorVersionUpgrade: true
+      LicenseModel: "general-public-license"
+      PubliclyAccessible: false
+      StorageType: "aurora"
+      MonitoringInterval: 0
+      PromotionTier: 0
+      EnablePerformanceInsights: false
+      DBParameterGroupName: !Ref RDSDBParameterGroup
+      CACertificateIdentifier: "rds-ca-rsa2048-g1"
+
+Outputs:
+  KMSKeyId:
+    Description: "KMS Key ID"
+    Value: !Ref KMSKey
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-KMSKeyId"
+
+  KMSKeyArn:
+    Description: "KMS Key ARN"
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-KMSKeyArn"
+
+  KMSAlias:
+    Description: "KMS Key Alias"
+    Value: !Ref KMSAlias
+
+  RDSDBCluster:
+    Description: "RDS DB Cluster"
+    Value: !Ref RDSDBCluster
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RDSDBCluster"
+
+  RDSDBClusterEndpoint:
+    Description: "RDS Cluster Endpoint"
+    Value: !GetAtt RDSDBCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RDSDBClusterEndpoint"
+
+  RDSDBClusterReaderEndpoint:
+    Description: "RDS Cluster Reader Endpoint"
+    Value: !GetAtt RDSDBCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RDSDBClusterReaderEndpoint"

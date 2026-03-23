@@ -39,10 +39,10 @@ aws cloudformation validate-template --template-body file://templates/TEMPLATE.y
 | 04 | `DEV_SHARED_04_env_lb.yaml` | 環境別 | Target Group, リスナールール, SNI証明書 |
 | 05 | `DEV_SHARED_05_adminer.yaml` | 共有 | Adminer ECSタスク + サービス |
 | 06 | `DEV_SHARED_06_bastion.yaml` | 共有 | 踏み台サーバ |
-| 07 | `DEV_SHARED_07_env_rds.yaml` | 環境別 | Aurora Serverless v2（予定） |
-| 08 | `DEV_SHARED_08_env_ecs.yaml` | 環境別 | ECSクラスタ + 全サービス（予定） |
-| 09 | `DEV_SHARED_09_env_ecr.yaml` | 環境別 | ECRリポジトリ（予定） |
-| 10 | `DEV_SHARED_10_env_pipeline.yaml` | 環境別 | CI/CDパイプライン（予定） |
+| 07 | `DEV_SHARED_07_env_rds.yaml` | 環境別 | Aurora Serverless v2 + KMS |
+| 08 | `DEV_SHARED_08_env_ecr.yaml` | 環境別 | ECRリポジトリ |
+| 09 | `DEV_SHARED_09_env_ecs.yaml` | 環境別 | ECSクラスタ + 全サービス（api, batch, mailpit, redis） |
+| 10 | `DEV_SHARED_10_env_pipeline.yaml` | 環境別 | CI/CDパイプライン（CodeBuild + CodePipeline） |
 
 ### Cross-Stack References
 
@@ -79,8 +79,8 @@ aws cloudformation validate-template --template-body file://templates/TEMPLATE.y
 ### SGの組み合わせ
 
 各ECSタスクにアタッチするSGの組み合わせ:
-- API = ApiSG + RdsSG + RedisSG + SGSharedMgt
-- Batch = RdsSG + SGSharedMgt
+- API = ApiSG + RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
+- Batch = RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
 - Mailpit = MailpitWebSG + MailpitSmtpSG + SGSharedMgt
 - Redis = RedisSG + SGSharedMgt
 - Adminer = SGSharedAdminer + SGSharedMgt

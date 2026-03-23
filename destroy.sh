@@ -11,7 +11,7 @@ set -euo pipefail
 AWS_PROFILE="dev-skg04"
 AWS_REGION="ap-northeast-1"
 
-ENVIRONMENTS=("develop" "dev-ope" "dev-front")
+ENVIRONMENTS=("develop" "dev-ope" "dev-front" "dev-demo")
 
 # ==============================================================================
 # スタック削除（存在しない場合はスキップ）
@@ -53,31 +53,55 @@ echo "  Region:  $AWS_REGION"
 echo "============================================"
 echo ""
 
-echo "[1/6] Deleting 06_bastion..."
+echo "[1/10] Deleting 10_env_pipeline (per-environment)..."
+for env_name in "${ENVIRONMENTS[@]}"; do
+  delete_stack "DEV-SHARED-10-env-pipeline-${env_name}"
+done
+echo ""
+
+echo "[2/10] Deleting 09_env_ecs (per-environment)..."
+for env_name in "${ENVIRONMENTS[@]}"; do
+  delete_stack "DEV-SHARED-09-env-ecs-${env_name}"
+done
+echo ""
+
+echo "[3/10] Deleting 08_env_ecr (per-environment)..."
+for env_name in "${ENVIRONMENTS[@]}"; do
+  delete_stack "DEV-SHARED-08-env-ecr-${env_name}"
+done
+echo ""
+
+echo "[4/10] Deleting 07_env_rds (per-environment)..."
+for env_name in "${ENVIRONMENTS[@]}"; do
+  delete_stack "DEV-SHARED-07-env-rds-${env_name}"
+done
+echo ""
+
+echo "[5/10] Deleting 06_bastion..."
 delete_stack "DEV-SHARED-06-bastion"
 echo ""
 
-echo "[2/6] Deleting 05_adminer..."
+echo "[6/10] Deleting 05_adminer..."
 delete_stack "DEV-SHARED-05-adminer"
 echo ""
 
-echo "[3/6] Deleting 04_env_lb (per-environment)..."
+echo "[7/10] Deleting 04_env_lb (per-environment)..."
 for env_name in "${ENVIRONMENTS[@]}"; do
   delete_stack "DEV-SHARED-04-env-lb-${env_name}"
 done
 echo ""
 
-echo "[4/6] Deleting 03_lb..."
+echo "[8/10] Deleting 03_lb..."
 delete_stack "DEV-SHARED-03-lb"
 echo ""
 
-echo "[5/6] Deleting 02_env_sg (per-environment)..."
+echo "[9/10] Deleting 02_env_sg (per-environment)..."
 for env_name in "${ENVIRONMENTS[@]}"; do
   delete_stack "DEV-SHARED-02-env-sg-${env_name}"
 done
 echo ""
 
-echo "[6/6] Deleting 01_network..."
+echo "[10/10] Deleting 01_network..."
 delete_stack "DEV-SHARED-01-network"
 echo ""
 

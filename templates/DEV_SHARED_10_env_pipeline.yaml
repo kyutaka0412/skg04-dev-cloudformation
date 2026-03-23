@@ -1,0 +1,508 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment CI/CD Pipeline (CodeBuild + CodePipeline)"
+
+# ==============================================================================
+# CI/CDパイプライン
+# CodeBuild（ビルド + マイグレーション）+ CodePipeline
+# IAMロール・S3バケットポリシーも含む
+#
+# 依存する共有リソース:
+#   - Subnet (01_network)
+#   - SG (01_network, 02_env_sg)
+#   - KMS Key (07_env_rds)
+#   - ECS Cluster/Service (08_env_ecs)
+#
+# 事前に必要なリソース（テンプレート外）:
+#   - S3バケット: ${MyEnvironment}-${MyProject}-${EnvName}-artifacts
+#   - GitHub Connection（CodeStar）
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+      - "dev-demo"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+  MyFullRepositoryId:
+    Type: String
+    Default: "shiki-lab/skg04"
+
+  GitHubConnectionArn:
+    Type: String
+    Description: "CodeStar GitHub接続のARN"
+
+Mappings:
+  # GitHubブランチ名
+  GithubBranchMapping:
+    develop:
+      MyGithubBranch: "develop"
+    dev-ope:
+      MyGithubBranch: "dev-ope"
+    dev-front:
+      MyGithubBranch: "dev-front"
+    dev-demo:
+      MyGithubBranch: "dev-demo"
+
+Resources:
+  # ============================================================================
+  # S3 Bucket（アーティファクト用）
+  # ============================================================================
+  S3BucketArtifacts:
+    Type: "AWS::S3::Bucket"
+    Properties:
+      BucketName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+      Tags:
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "s3"
+
+  # ============================================================================
+  # IAM Roles & Policies
+  # ============================================================================
+  CodePipelinePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-codepipeline-policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "codedeploy:RegisterApplicationRevision"
+              - "codedeploy:GetDeploymentConfig"
+              - "codedeploy:GetDeployment"
+              - "codedeploy:GetApplicationRevision"
+              - "codedeploy:GetApplication"
+              - "codedeploy:CreateDeployment"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "sqs:*"
+              - "sns:*"
+              - "s3:*"
+              - "rds:*"
+              - "elasticloadbalancing:*"
+              - "elasticbeanstalk:*"
+              - "ecs:*"
+              - "ec2:*"
+              - "cloudwatch:*"
+              - "cloudformation:*"
+              - "autoscaling:*"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "codebuild:StartBuild"
+              - "codebuild:BatchGetBuilds"
+            Resource: "*"
+          - Effect: "Allow"
+            Action: "iam:PassRole"
+            Condition:
+              StringLike:
+                "iam:PassedToService": "ecs-tasks.amazonaws.com"
+            Resource: "*"
+
+  GitHubConnectPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-githubconnect-policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts/*"
+          - Effect: "Allow"
+            Action:
+              - "codestar-connections:UseConnection"
+            Resource: !Ref GitHubConnectionArn
+          - Effect: "Allow"
+            Action:
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:StartBuild"
+            Resource: "*"
+
+  KMSUsePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-use-kms-policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "kms:Decrypt"
+              - "kms:DescribeKey"
+              - "kms:Encrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+            Resource:
+              Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-KMSKeyArn"
+
+  CodePipelineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-codepipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "codepipeline.amazonaws.com"
+            Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - !Ref KMSUsePolicy
+        - !Ref CodePipelinePolicy
+        - !Ref GitHubConnectPolicy
+
+  # ============================================================================
+  # CodeBuild IAM Role & Policies
+  # ============================================================================
+  CodeBuildPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-codebuild-policy"
+      Path: "/"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # CloudWatch Logs
+          - Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource: "*"
+          # EC2（VPC内CodeBuild用）
+          - Effect: "Allow"
+            Action:
+              - "ec2:CreateNetworkInterface"
+              - "ec2:DescribeDhcpOptions"
+              - "ec2:DescribeNetworkInterfaces"
+              - "ec2:DeleteNetworkInterface"
+              - "ec2:DescribeSubnets"
+              - "ec2:DescribeSecurityGroups"
+              - "ec2:DescribeVpcs"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "ec2:CreateNetworkInterfacePermission"
+            Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+            Condition:
+              StringEquals:
+                ec2:Subnet:
+                  - !Sub
+                    - "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetA}"
+                    - SubnetA:
+                        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+                  - !Sub
+                    - "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${SubnetC}"
+                    - SubnetC:
+                        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+                ec2:AuthorizedService: "codebuild.amazonaws.com"
+          # S3 アーティファクト
+          - Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts/*"
+          # ECR
+          - Effect: "Allow"
+            Action:
+              - "ecr:GetAuthorizationToken"
+            Resource: "*"
+          - Effect: "Allow"
+            Action:
+              - "ecr:BatchCheckLayerAvailability"
+              - "ecr:GetDownloadUrlForLayer"
+              - "ecr:BatchGetImage"
+              - "ecr:PutImage"
+              - "ecr:InitiateLayerUpload"
+              - "ecr:UploadLayerPart"
+              - "ecr:CompleteLayerUpload"
+            Resource: !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${MyEnvironment}-${MyProject}-${EnvName}-api"
+          # CodeBuild レポート
+          - Effect: "Allow"
+            Action:
+              - "codebuild:CreateReportGroup"
+              - "codebuild:CreateReport"
+              - "codebuild:UpdateReport"
+              - "codebuild:BatchPutTestCases"
+              - "codebuild:BatchPutCodeCoverages"
+            Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${MyEnvironment}-${MyProject}-${EnvName}-*"
+          # Secrets Manager（環境変数取得用）
+          - Effect: "Allow"
+            Action:
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+              - "secretsmanager:ListSecretVersionIds"
+            Resource: "*"
+
+  CodeBuildRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      RoleName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-build-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: "codebuild.amazonaws.com"
+            Action: "sts:AssumeRole"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - !Ref CodeBuildPolicy
+        - !Ref KMSUsePolicy
+
+  S3BucketPolicyArtifacts:
+    Type: "AWS::S3::BucketPolicy"
+    Properties:
+      Bucket: !Ref S3BucketArtifacts
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "CodepipelineArtifacts"
+            Effect: "Allow"
+            Principal:
+              AWS:
+                - !GetAtt CodePipelineRole.Arn
+                - !GetAtt CodeBuildRole.Arn
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts/*"
+              - !Sub "arn:aws:s3:::${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+
+  # ============================================================================
+  # CodeBuild Projects
+  # ============================================================================
+  CodeBuildProjectApi:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Description: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Source:
+        BuildSpec: !Sub "buildspec.${EnvName}.yml"
+        InsecureSsl: false
+        Location: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-artifacts/source_output"
+        Type: "S3"
+      Artifacts:
+        EncryptionDisabled: false
+        Location: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+        Name: "web_build_output"
+        NamespaceType: "BUILD_ID"
+        OverrideArtifactName: false
+        Packaging: "ZIP"
+        Type: "S3"
+      Cache:
+        Type: "NO_CACHE"
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0-24.05.15"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: true
+        Type: "LINUX_CONTAINER"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 480
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      BadgeEnabled: false
+      LogsConfig:
+        CloudWatchLogs:
+          Status: "ENABLED"
+          GroupName: !Sub "/codebuild/${EnvName}/api"
+        S3Logs:
+          Status: "DISABLED"
+          EncryptionDisabled: false
+      Visibility: "PRIVATE"
+
+  CodeBuildProjectMigration:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-migration"
+      Description: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-migration"
+      Source:
+        BuildSpec: !Sub "buildspec.${EnvName}.migration.yml"
+        InsecureSsl: false
+        Location: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-artifacts/source_output"
+        Type: "S3"
+      Artifacts:
+        EncryptionDisabled: false
+        Location: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-artifacts"
+        Name: "build_output"
+        NamespaceType: "BUILD_ID"
+        OverrideArtifactName: false
+        Packaging: "ZIP"
+        Type: "S3"
+      Cache:
+        Type: "NO_CACHE"
+      Environment:
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/standard:7.0-24.05.15"
+        ImagePullCredentialsType: "CODEBUILD"
+        PrivilegedMode: true
+        Type: "LINUX_CONTAINER"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 60
+      QueuedTimeoutInMinutes: 480
+      EncryptionKey: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3"
+      VpcConfig:
+        VpcId:
+          Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-VPCId"
+        Subnets:
+          - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+          - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RdsSG"
+      BadgeEnabled: false
+      LogsConfig:
+        CloudWatchLogs:
+          Status: "ENABLED"
+          GroupName: !Sub "/codebuild/${EnvName}/api"
+        S3Logs:
+          Status: "DISABLED"
+          EncryptionDisabled: false
+      Visibility: "PRIVATE"
+
+  # ============================================================================
+  # CodePipeline
+  # ============================================================================
+  CodePipelineApi:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        EncryptionKey:
+          Id: !Sub
+            - "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${MyEnvironment}-${MyProject}-${EnvName}-kms"
+            - {}
+          Type: "KMS"
+        Location: !Ref S3BucketArtifacts
+        Type: "S3"
+      Stages:
+        - Name: "Source"
+          Actions:
+            - Name: "SourceApi"
+              ActionTypeId:
+                Category: "Source"
+                Owner: "AWS"
+                Provider: "CodeStarSourceConnection"
+                Version: "1"
+              Configuration:
+                BranchName:
+                  !FindInMap [
+                    GithubBranchMapping,
+                    !Ref EnvName,
+                    MyGithubBranch,
+                  ]
+                ConnectionArn: !Ref GitHubConnectionArn
+                DetectChanges: "true"
+                FullRepositoryId: !Ref MyFullRepositoryId
+                OutputArtifactFormat: "CODE_ZIP"
+              OutputArtifacts:
+                - Name: "SourceApi"
+              RunOrder: 1
+        - Name: "BuildAndMigration"
+          Actions:
+            - Name: "Build"
+              ActionTypeId:
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration:
+                PrimarySource: "SourceApi"
+                ProjectName: !Ref CodeBuildProjectApi
+              InputArtifacts:
+                - Name: "SourceApi"
+              OutputArtifacts:
+                - Name: "Build"
+              RunOrder: 1
+            - Name: "Migration"
+              ActionTypeId:
+                Category: "Build"
+                Owner: "AWS"
+                Provider: "CodeBuild"
+                Version: "1"
+              Configuration:
+                PrimarySource: "SourceApi"
+                ProjectName: !Ref CodeBuildProjectMigration
+              InputArtifacts:
+                - Name: "SourceApi"
+              RunOrder: 1
+        - Name: "Deploy"
+          Actions:
+            - Name: "Deploy"
+              ActionTypeId:
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "ECS"
+                Version: "1"
+              Configuration:
+                ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+                ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+              InputArtifacts:
+                - Name: "Build"
+              RunOrder: 3
+            - Name: "DeployBatch"
+              ActionTypeId:
+                Category: "Deploy"
+                Owner: "AWS"
+                Provider: "ECS"
+                Version: "1"
+              Configuration:
+                ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+                FileName: "imagedefinitions.json"
+                ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+              InputArtifacts:
+                - Name: "Build"
+              RunOrder: 3
+
+Outputs:
+  CodePipelineApi:
+    Description: "CodePipeline for API"
+    Value: !Ref CodePipelineApi
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-CodePipelineApi"
+
+  CodeBuildProjectApi:
+    Description: "CodeBuild Project for API"
+    Value: !Ref CodeBuildProjectApi
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-CodeBuildProjectApi"

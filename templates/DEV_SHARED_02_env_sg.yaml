@@ -8,7 +8,7 @@ Description: "Per-environment Security Groups - deployed per environment via par
 #
 #   各ECSタスクにアタッチするSGの組み合わせ:
 #     API   = ApiSG + RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
-#     Batch = RdsSG + SGSharedMgt
+#     Batch = RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
 #     Mailpit = MailpitWebSG + MailpitSmtpSG + SGSharedMgt
 #     Redis = RedisSG + SGSharedMgt
 #     RDS   = RdsSG
@@ -23,6 +23,7 @@ Parameters:
       - "develop"
       - "dev-ope"
       - "dev-front"
+      - "dev-demo"
 
   MyProject:
     Type: String

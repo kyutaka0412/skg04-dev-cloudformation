@@ -1,0 +1,80 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment ECR Repository"
+
+# ==============================================================================
+# ECRリポジトリ
+# 環境ごとに独立したリポジトリを作成
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+      - "dev-demo"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+Resources:
+  ECRRepositoryApi:
+    Type: "AWS::ECR::Repository"
+    Properties:
+      RepositoryName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "未タグイメージを30日後に削除",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 30
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "service_role"
+          Value: "ecr"
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+
+Outputs:
+  ECRRepositoryApi:
+    Description: "ECR Repository for API"
+    Value: !Ref ECRRepositoryApi
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECRRepositoryApi"
+
+  ECRRepositoryApiUri:
+    Description: "ECR Repository URI for API"
+    Value: !GetAtt ECRRepositoryApi.RepositoryUri
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECRRepositoryApiUri"
