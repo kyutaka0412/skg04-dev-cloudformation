@@ -1,0 +1,517 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Per-environment ECS Clusters + Services (api, batch, mailpit, redis)"
+
+# ==============================================================================
+# ECSクラスタ・サービス・タスク定義・ロググループ
+# 4つのクラスタ（api, batch, mailpit, redis）を1テンプレートに統合
+#
+# TaskDefinitionは初期定義のみCFn管理。
+# CI/CDが新リビジョンをデプロイするため、CFnとの競合を避ける。
+#
+# 依存する共有リソース:
+#   - Subnet (01_network)
+#   - SG (01_network, 02_env_sg)
+#   - Target Group (04_env_lb)
+#   - IAM Role (05_adminer)
+#   - RDS Cluster Endpoint (07_env_rds)
+#   - ECR Repository (09_env_ecr)
+#
+# SG組み合わせ:
+#   API   = ApiSG + RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
+#   Batch = RdsSG + RedisSG + MailpitSmtpSG + SGSharedMgt
+#   Mailpit = MailpitWebSG + MailpitSmtpSG + SGSharedMgt
+#   Redis = RedisSG + SGSharedMgt
+# ==============================================================================
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: "環境名"
+    AllowedValues:
+      - "develop"
+      - "dev-ope"
+      - "dev-front"
+      - "dev-demo"
+
+  MyProject:
+    Type: String
+    Default: "skg04"
+
+  MyEnvironment:
+    Type: String
+    Default: "dev-shared"
+
+  MyManagedBy:
+    Type: String
+    Default: "CloudFormation"
+
+Resources:
+  # ============================================================================
+  # Log Groups
+  # ============================================================================
+  LogsLogGroupApi:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/api"
+      RetentionInDays: 30
+
+  LogsLogGroupBatch:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/batch"
+      RetentionInDays: 30
+
+  LogsLogGroupMailpit:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/mailpit"
+      RetentionInDays: 30
+
+  LogsLogGroupRedis:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/redis"
+      RetentionInDays: 30
+
+  # ============================================================================
+  # API Cluster + Service + TaskDefinition
+  # ============================================================================
+  ECSClusterApi:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      CapacityProviders:
+        - "FARGATE"
+        - "FARGATE_SPOT"
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: "FARGATE_SPOT"
+          Weight: 100
+          Base: 0
+        - CapacityProvider: "FARGATE"
+          Weight: 0
+          Base: 0
+      ServiceConnectDefaults:
+        Namespace: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ecs-cluster-api"
+
+  ECSTaskDefinitionApi:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        - Essential: true
+          Image: "nginx:latest"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/api"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+          Name: "api"
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: "tcp"
+            - ContainerPort: 1025
+              HostPort: 1025
+              Protocol: "tcp"
+            - ContainerPort: 6379
+              HostPort: 6379
+              Protocol: "tcp"
+      Family: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskRoleArn"
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskExecRoleArn"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "256"
+      Memory: "512"
+
+  ECSServiceApi:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+      - ECSClusterApi
+    Properties:
+      ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Cluster: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${MyEnvironment}-${MyProject}-${EnvName}-api"
+      DesiredCount: 1
+      TaskDefinition: !Ref ECSTaskDefinitionApi
+      LaunchType: "FARGATE"
+      PlatformVersion: "1.4.0"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ApiSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RdsSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RedisSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitSmtpSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          Subnets:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+      LoadBalancers:
+        - TargetGroupArn:
+            Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ApiTargetGroup"
+          ContainerName: "api"
+          ContainerPort: 80
+      HealthCheckGracePeriodSeconds: 5
+      SchedulingStrategy: "REPLICA"
+      DeploymentController:
+        Type: "ECS"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+
+  # ============================================================================
+  # Batch Cluster + Service + TaskDefinition
+  # ============================================================================
+  ECSClusterBatch:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+      CapacityProviders:
+        - "FARGATE_SPOT"
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: "FARGATE_SPOT"
+          Weight: 1
+          Base: 1
+
+  ECSTaskDefinitionBatch:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - "bundle"
+            - "exec"
+            - "sidekiq"
+          Essential: true
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${MyEnvironment}-${MyProject}-${EnvName}-api:latest"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/batch"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+          Name: "batch"
+          PortMappings:
+            - ContainerPort: 6379
+              HostPort: 6379
+              Protocol: "tcp"
+      Family: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskRoleArn"
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskExecRoleArn"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "256"
+      Memory: "512"
+
+  ECSServiceBatch:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+      - ECSClusterBatch
+    Properties:
+      ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+      Cluster: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${MyEnvironment}-${MyProject}-${EnvName}-batch"
+      DesiredCount: 1
+      TaskDefinition: !Ref ECSTaskDefinitionBatch
+      LaunchType: "FARGATE"
+      PlatformVersion: "1.4.0"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RdsSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RedisSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitSmtpSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          Subnets:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+      SchedulingStrategy: "REPLICA"
+      DeploymentController:
+        Type: "ECS"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-batch"
+
+  # ============================================================================
+  # Mailpit Cluster + Service + TaskDefinition
+  # ============================================================================
+  ECSClusterMailpit:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit"
+      CapacityProviders:
+        - "FARGATE_SPOT"
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: "FARGATE_SPOT"
+          Weight: 1
+          Base: 1
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ecs-cluster-mailpit"
+
+  ECSTaskDefinitionMailpit:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        - Essential: true
+          Image: "axllent/mailpit:latest"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/mailpit"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+          Name: "mailpit"
+          PortMappings:
+            - ContainerPort: 8025
+              HostPort: 8025
+              Protocol: "tcp"
+            - ContainerPort: 1025
+              HostPort: 1025
+              Protocol: "tcp"
+              Name: "mailpit-1025-tcp"
+      Family: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit"
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskRoleArn"
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskExecRoleArn"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "256"
+      Memory: "512"
+
+  ECSServiceMailpit:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+      - ECSClusterMailpit
+    Properties:
+      ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit"
+      Cluster: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${MyEnvironment}-${MyProject}-${EnvName}-mailpit"
+      DesiredCount: 1
+      TaskDefinition: !Ref ECSTaskDefinitionMailpit
+      # LaunchType未指定 → ClusterのDefaultCapacityProviderStrategy（FARGATE_SPOT）を使用
+      PlatformVersion: "1.4.0"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitWebSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitSmtpSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          Subnets:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+      LoadBalancers:
+        - TargetGroupArn:
+            Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-MailpitTargetGroup"
+          ContainerName: "mailpit"
+          ContainerPort: 8025
+      HealthCheckGracePeriodSeconds: 5
+      SchedulingStrategy: "REPLICA"
+      DeploymentController:
+        Type: "ECS"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+        Services:
+          - DiscoveryName: "mailpit-1025-tcp"
+            ClientAliases:
+              - DnsName: !Sub "mailpit-1025-tcp.${MyEnvironment}-${MyProject}-${EnvName}-api"
+                Port: 1025
+            PortName: "mailpit-1025-tcp"
+      Tags:
+        - Key: "service_role"
+          Value: "ecs"
+        - Key: "project"
+          Value: !Ref MyProject
+        - Key: "environment"
+          Value: !Ref EnvName
+        - Key: "managed_by"
+          Value: !Ref MyManagedBy
+        - Key: "Name"
+          Value: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-mailpit"
+
+  # ============================================================================
+  # Redis Cluster + Service + TaskDefinition
+  # ============================================================================
+  ECSClusterRedis:
+    Type: "AWS::ECS::Cluster"
+    Properties:
+      ClusterName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+      CapacityProviders:
+        - "FARGATE_SPOT"
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: "FARGATE_SPOT"
+          Weight: 1
+          Base: 1
+
+  ECSTaskDefinitionRedis:
+    Type: "AWS::ECS::TaskDefinition"
+    Properties:
+      ContainerDefinitions:
+        - Essential: true
+          Image: "valkey/valkey:8.1"
+          LogConfiguration:
+            LogDriver: "awslogs"
+            Options:
+              awslogs-group: !Sub "/${MyEnvironment}-${EnvName}/${MyProject}/ecs/redis"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "ecs"
+          Name: "redis"
+          PortMappings:
+            - ContainerPort: 6379
+              HostPort: 6379
+              Protocol: "tcp"
+              Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+      Family: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskRoleArn"
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EcsTaskExecRoleArn"
+      NetworkMode: "awsvpc"
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "256"
+      Memory: "512"
+
+  ECSServiceRedis:
+    Type: "AWS::ECS::Service"
+    DependsOn:
+      - ECSClusterRedis
+    Properties:
+      ServiceName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+      Cluster: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${MyEnvironment}-${MyProject}-${EnvName}-redis"
+      DesiredCount: 1
+      TaskDefinition: !Ref ECSTaskDefinitionRedis
+      # LaunchType未指定 → ClusterのDefaultCapacityProviderStrategy（FARGATE_SPOT）を使用
+      PlatformVersion: "1.4.0"
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: false
+          Rollback: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: "DISABLED"
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-RedisSG"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-SGSharedMgt"
+          Subnets:
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateA"
+            - Fn::ImportValue: !Sub "${MyEnvironment}-${MyProject}-EC2SubnetPrivateC"
+      SchedulingStrategy: "REPLICA"
+      DeploymentController:
+        Type: "ECS"
+      ServiceConnectConfiguration:
+        Enabled: true
+        Namespace: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-api"
+        Services:
+          - DiscoveryName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+            ClientAliases:
+              - DnsName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis.${MyEnvironment}-${MyProject}-${EnvName}-api"
+                Port: 6379
+            PortName: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-redis"
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  ECSClusterApi:
+    Description: "ECS Cluster for API"
+    Value: !Ref ECSClusterApi
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSClusterApi"
+
+  ECSClusterBatch:
+    Description: "ECS Cluster for Batch"
+    Value: !Ref ECSClusterBatch
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSClusterBatch"
+
+  ECSClusterMailpit:
+    Description: "ECS Cluster for Mailpit"
+    Value: !Ref ECSClusterMailpit
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSClusterMailpit"
+
+  ECSClusterRedis:
+    Description: "ECS Cluster for Redis"
+    Value: !Ref ECSClusterRedis
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSClusterRedis"
+
+  ECSServiceApi:
+    Description: "ECS Service for API"
+    Value: !Ref ECSServiceApi
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSServiceApi"
+
+  ECSServiceBatch:
+    Description: "ECS Service for Batch"
+    Value: !Ref ECSServiceBatch
+    Export:
+      Name: !Sub "${MyEnvironment}-${MyProject}-${EnvName}-ECSServiceBatch"
